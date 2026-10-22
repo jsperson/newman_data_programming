@@ -1,0 +1,20 @@
+
+1. According to me, how do you know when you've outgrown Excel and need a database?
+You need to store and manage large datasets.
+You require data integrity, security, and multi-user access.
+You need to run complex queries and reports.
+
+2. When it comes to relational vs. non-relational databases, approximately what percentage of the class will be spend discussiong relational databases?
+We will spend approximately 95% of our time on relational databases and just touch on non-relational databases a bit.
+
+3. In the parlance of datbases, what are 3 synonyms for columns mentioned in the video?
+Attributes
+Fields
+Properties
+
+4. What are two DBMS's associated with Microsoft SQL Server?
+SQL Server Management Server (SSMS)
+Azure Data Studio
+
+5. What is the main difference between SQLite and the other database applications discussed?
+It is very light and doesn't actually install as server software.
