@@ -1,0 +1,345 @@
+SQL SERVER 2025 IN DOCKER - INSTALLATION NOTEBOOK
+==================================================
+
+Course:   Newman Data Programming
+Date:     2026-10-21
+Machine:  Lenovo ThinkPad T480, x86-64, Omarchy Linux (Arch-based), Docker 29.9.1
+Network:  Tailscale node "omarchy", Tailscale IPv4 100.94.249.116
+Client:   Mac Studio "office-mac-studio", Tailscale IPv4 100.75.70.51
+Repo:     ~/source/newman_data_programming/assignments/sql_server_install/
+
+All times are local (America/Chicago, CDT).
+
+This notebook records everything done to get SQL Server 2025 running in Docker,
+including the things that went wrong. Where a screenshot belongs, there is a
+line marked [SCREENSHOT] with a note about what it should show. Screenshots
+will be pasted in when this is converted to the Word/PDF submission.
+
+
+1. GOAL AND DESIGN DECISIONS
+----------------------------
+
+The assignment gave these commands:
+
+    docker volume create mssql1data
+    docker run -e "ACCEPT_EULA=Y" -e "MSSQL_SA_PASSWORD=Password123" -p 1433:1433 \
+      --name mssql1 --hostname mssql1 -v sql1data:/var/opt/mssql -d \
+      mcr.microsoft.com/mssql/server:2025-latest
+
+I wanted the server reachable from my other devices over Tailscale, but NOT
+exposed on the home LAN or any public interface. I also did not want the
+container starting itself at boot. This is a class box, not production.
+
+Problems spotted in the assignment command before running anything:
+
+  a) Volume name mismatch. The first line creates "mssql1data" but the run
+     command mounts "sql1data". Docker would silently create a second, empty
+     volume named sql1data and the one I created would sit unused.
+     Fix: use mssql1data in both places.
+
+  b) Weak, shared password. "Password123" is in every tutorial on the internet.
+     Fix: a unique password that meets SQL Server complexity rules (8+ chars,
+     3 of 4 character classes), stored in my password manager, and never typed
+     on a command line where it would land in shell history.
+
+  c) Port published on all interfaces. "-p 1433:1433" binds 0.0.0.0, which
+     means the LAN and anything else that can reach this laptop.
+     Fix: bind only the Tailscale address: -p 100.94.249.116:1433:1433
+
+Earlier background work (done on the Mac Studio, previous day):
+  - Confirmed the 2025-latest tag exists on mcr.microsoft.com.
+    2025-RTM-ubuntu-22.04 noted as a pinned fallback.
+  - Confirmed ports 22 and 1433 on the ThinkPad's Tailscale IP were closed.
+
+
+2. REPO SETUP
+-------------
+
+15:55  Cloned the course repo to ~/source/newman_data_programming.
+       The clone came back with a warning: "You appear to have cloned an
+       empty repository." The repo was created on GitHub on 2026-10-19 with
+       no commits yet, so this is expected, not an error.
+
+15:56  Created assignments/sql_server_install/ inside the repo. Git does not
+       track empty folders, so it only shows up once a file is in it.
+
+16:08  Side task: installed plain vi (the original ex/vi, package "vi"
+       1:070224-9 from the omarchy repo). Neither vi nor vim had been present.
+       Not SQL related, just needed an editor on the console.
+
+
+3. PRE-INSTALL INSPECTION (read-only, nothing changed)
+------------------------------------------------------
+
+Before touching anything I checked the state of the machine.
+
+Commands:
+    docker info
+    docker ps -a
+    docker volume ls
+    docker volume inspect mssql1data sql1data
+    docker images
+    tailscale ip -4
+    sudo ss -tlnp | grep 1433
+    systemctl is-enabled docker docker.socket tailscaled
+    id -nG
+    cat /etc/docker/daemon.json
+    sudo ufw status verbose
+    sudo iptables -S DOCKER-USER
+
+Results:
+    Docker 29.9.1, overlayfs storage, cgroup v2
+    No containers. No volumes. No mssql images.
+    "docker volume inspect" for both names: "no such volume"  <- good, clean slate
+    Tailscale IP: 100.94.249.116
+    Nothing listening on 1433
+    docker.service DISABLED, docker.socket ENABLED (socket activated)
+    tailscaled.service enabled and active
+    My user is in the docker and wheel groups
+    15 GiB RAM, 10 GiB available (SQL Server needs 2 GiB minimum)
+    ufw active: default deny incoming, deny routed
+    ufw-docker 251123-2 installed; DOCKER-USER chain present
+
+[SCREENSHOT] terminal showing docker ps -a / docker volume ls empty and
+             tailscale ip -4 output.
+
+Two findings that changed the plan:
+
+  FINDING 1 - Boot ordering is a non-issue.
+    I had worried that if docker started before tailscaled at boot, a
+    container bound to the Tailscale IP would fail with "cannot assign
+    requested address". But docker.service is disabled on Omarchy; the daemon
+    is socket-activated and only starts on the first docker command. Combined
+    with no restart policy on the container, there is no race. No fix needed.
+
+  FINDING 2 - Omarchy's firewall will block Tailscale clients.
+    Omarchy ships ufw with ufw-docker. The DOCKER-USER iptables chain only
+    forwards traffic to containers when the SOURCE is a private range
+    (10/8, 172.16/12, 192.168/16). Tailscale uses 100.64.0.0/10, which is not
+    in that list. So even with the port bound to the Tailscale IP, a
+    connection from the Mac would be DNAT'd to the container and then dropped.
+    This is the classic "Docker ignores ufw" problem, except Omarchy has
+    already fixed that half, which creates this new one.
+    Fix (step 6 below): one ufw route rule scoped to the tailscale0 interface.
+
+
+4. PASSWORD SETUP
+-----------------
+
+Chose a unique SA password and saved it in my password manager first.
+Avoided quotes, #, spaces, ! and $ so neither the env file nor the Mac shell
+would mangle it.
+
+Wrote it to a root-owned, mode 600 env file without it ever appearing on a
+command line or in history:
+
+    read -rsp 'SA password: ' pw; echo
+    printf 'ACCEPT_EULA=Y\nMSSQL_SA_PASSWORD=%s\n' "$pw" | sudo sh -c 'umask 077; cat > /root/mssql1.env'
+    unset pw
+    sudo ls -l /root/mssql1.env
+      -> -rw------- 1 root root ... /root/mssql1.env
+
+Why an env file: docker run --env-file reads it once at container creation.
+After that the values are baked into the container config, and SQL Server
+stores the SA password in the master database on the volume. The file can be
+destroyed right after the run.
+
+Known caveat: the password is still visible in "docker inspect mssql1" to
+anyone with access to the docker socket. Acceptable for a class box.
+
+
+5. PULLING THE IMAGE AND CREATING THE CONTAINER
+-----------------------------------------------
+
+16:11  Ran:
+
+    docker volume create mssql1data
+    sudo docker run --env-file /root/mssql1.env \
+      -p 100.94.249.116:1433:1433 \
+      --name mssql1 --hostname mssql1 \
+      -v mssql1data:/var/opt/mssql -d \
+      mcr.microsoft.com/mssql/server:2025-latest
+    sudo shred -u /root/mssql1.env
+
+The image was not present locally, so docker run pulled it first.
+
+    Image:   mcr.microsoft.com/mssql/server:2025-latest
+    Digest:  sha256:742481d1b1186cccc81220a1eaacef244ca8d0f7d19c8e5c70df8ae541ffbab2
+    Size:    2.42 GB
+    SQL Server build: 2025 (RTM-CU9-GDR) (KB5126967) - 17.0.5015.4 (X64)
+
+    Container created:  2026-10-21 16:11:34 CDT
+    Container started:  2026-10-21 16:11:35 CDT
+    "SQL Server is now ready for client connections" logged at 16:11:46,
+    about 11 seconds after start.
+
+[SCREENSHOT] docker run output showing the image layers being pulled and the
+             container ID printed at the end.
+[SCREENSHOT] docker images showing mcr.microsoft.com/mssql/server 2025-latest.
+[SCREENSHOT] docker ps showing mssql1 Up, PORTS column 100.94.249.116:1433->1433/tcp
+[SCREENSHOT] docker logs mssql1 | grep "now ready"
+
+Note: "sudo" was needed on docker run only because the env file was
+root-owned. My user is in the docker group so every other docker command runs
+without sudo.
+
+Confirmed afterwards that /root/mssql1.env no longer exists (shred -u).
+
+
+6. FIREWALL RULE FOR TAILSCALE CLIENTS
+--------------------------------------
+
+16:12  Ran:
+
+    sudo ufw route allow in on tailscale0 proto tcp to any port 1433
+
+Resulting rule as ufw shows it:
+
+    1433/tcp                   ALLOW FWD   Anywhere on tailscale0
+    1433/tcp (v6)              ALLOW FWD   Anywhere (v6) on tailscale0
+
+Underlying iptables rule:
+
+    -A ufw-user-forward -i tailscale0 -p tcp -m tcp --dport 1433 -j ACCEPT
+
+Because it is restricted to the tailscale0 interface, the LAN gains nothing.
+Nothing on the LAN can reach 1433 anyway since the port is not published
+there, so this is belt and suspenders.
+
+16:15  Ran the same command a second time while chasing the false alarm
+       described in section 8. ufw reported "Skipping adding existing rule",
+       which is harmless.
+
+[SCREENSHOT] sudo ufw status verbose showing the two ALLOW FWD lines.
+
+
+7. VERIFICATION ON THE THINKPAD
+-------------------------------
+
+    docker logs mssql1 2>&1 | grep -m1 'SQL Server is now ready'
+      -> 2026-10-21 21:11:46.93 spid37s  SQL Server is now ready for client connections.
+
+    docker port mssql1
+      -> 1433/tcp -> 100.94.249.116:1433        (only the Tailscale IP)
+
+    sudo ss -tlnp | grep 1433
+      -> LISTEN on 100.94.249.116:1433 (docker-proxy)
+      -> nothing on 0.0.0.0:1433 or [::]:1433
+
+    docker inspect mssql1 --format '{{.HostConfig.RestartPolicy.Name}}'
+      -> no                                     (manual start only, as intended)
+
+[SCREENSHOT] docker port + ss output together.
+
+
+8. HELPER SCRIPTS AND A BUG IN ONE OF THEM
+------------------------------------------
+
+To make this repeatable I wrote two scripts in the same folder.
+
+  start_mssql.sh
+    - If the container does not exist: says so and points at the README.
+    - If it is already running: says so (with start time) and validates.
+    - If stopped: checks the Tailscale IP is up, starts the container, and
+      waits up to 90 s for the ready line in THIS run's logs (not an old one).
+    - Validates: running, ready line, docker port shows only the Tailscale
+      IP, listener on 100.94.249.116:1433, no wildcard listener, no restart
+      policy, ufw route rule present.
+    - Exit 0 if all pass, 1 otherwise.
+
+  sqlcmd.sh
+    - Opens sqlcmd to the container as sa using the sqlcmd that ships inside
+      the image (/opt/mssql-tools18/bin/sqlcmd, version 18.7). Nothing to
+      install on the host.
+    - Prompts for the password, or uses SQLCMDPASSWORD if exported.
+    - Extra arguments pass through, so  ./sqlcmd.sh -Q "SELECT 1"  works,
+      and  ./sqlcmd.sh < file.sql  works because it only allocates a TTY
+      when stdin is one.
+
+MISTAKE: false "ufw rule missing" in start_mssql.sh
+    The first version of start_mssql.sh reported:
+        [FAIL] ufw route rule missing. README step 4.
+    even after I had added the rule (twice, see section 6). The rule was
+    fine. The script was grepping ufw's output for the pattern
+        "1433/tcp on tailscale0 ... ALLOW FWD"
+    but ufw actually prints the interface in the FROM column:
+        "1433/tcp    ALLOW FWD    Anywhere on tailscale0"
+    Lesson: when a check fails, look at the raw output before re-running the
+    fix. Corrected the pattern at 16:16; all seven checks then passed.
+
+Smoke test of sqlcmd.sh
+    Ran it non-interactively with a deliberately wrong password:
+        SQLCMDPASSWORD=x ./sqlcmd.sh -Q "SELECT 1" < /dev/null
+        -> Sqlcmd: Error: Microsoft ODBC Driver 18 for SQL Server :
+           Login failed for user 'sa'.
+    This is the expected failure. It proves the docker exec path, the
+    sqlcmd binary, and the TCP connection inside the container all work.
+    A real login is the next step.
+
+
+9. LOGGING INTO SQL SERVER                                       *** TODO ***
+--------------------------
+
+From the ThinkPad (inside the container, no network involved):
+
+    ./sqlcmd.sh
+    1> SELECT @@VERSION;
+    2> GO
+
+[SCREENSHOT] interactive session showing the version string.
+
+From the Mac Studio over Tailscale (proves a remote tailnet client works):
+
+    brew install sqlcmd
+    nc -vz 100.94.249.116 1433
+    sqlcmd -S 100.94.249.116,1433 -U sa -C -Q "SELECT @@VERSION;"
+
+    -C trusts the container's self-signed certificate.
+    sqlcmd prompts for the password when -P is omitted.
+
+[SCREENSHOT] nc success line and sqlcmd version output from the Mac.
+
+Troubleshooting notes for this step:
+    nc times out            -> firewall rule (section 6) or Tailscale ACLs
+    nc connects, sqlcmd fails -> wrong password, or server not ready yet
+
+
+10. DAY-TO-DAY USE
+------------------
+
+    ./start_mssql.sh        start (or confirm running) and validate
+    ./sqlcmd.sh             open a SQL prompt
+    docker stop mssql1      stop
+    docker logs -f mssql1   watch logs
+
+"docker start" will fail with "cannot assign requested address" if Tailscale
+is not up yet after a reboot. Wait a few seconds and retry.
+
+Teardown if ever needed:
+    docker stop mssql1 && docker rm mssql1
+    docker volume rm mssql1data            (destroys all databases!)
+    sudo ufw route delete allow in on tailscale0 proto tcp to any port 1433
+
+
+11. SUMMARY OF ISSUES AND LESSONS
+---------------------------------
+
+  1. Assignment command had mismatched volume names. Caught by reading
+     before running.
+  2. Omarchy's ufw-docker silently drops forwarded traffic from non-RFC1918
+     sources, which includes Tailscale. Needed one interface-scoped
+     route rule. Would have been a confusing "connection timed out" from
+     the Mac if not caught during inspection.
+  3. My own validation script had a wrong grep pattern and reported a
+     missing firewall rule that was actually present. Fixed by reading the
+     real ufw output.
+  4. Boot-ordering worry (docker before tailscaled) turned out to be moot
+     because Omarchy socket-activates docker and I chose no restart policy.
+  5. Keeping the password out of history: read -rs into a root-owned 600
+     file, --env-file once, shred. Worked cleanly.
+
+Files in this folder:
+    README.md         step-by-step runbook
+    start_mssql.sh    start + validate
+    sqlcmd.sh         client wrapper
+    install_log.txt   this notebook
