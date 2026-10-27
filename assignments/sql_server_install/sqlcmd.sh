@@ -9,7 +9,10 @@
 #   ./sqlcmd.sh < script.sql             run a .sql file from the host
 #
 # Password: prompts unless SQLCMDPASSWORD is exported in this shell.
-# Any extra arguments are passed straight through to sqlcmd.
+# Output defaults: -w 300 wrap width, -Y 30 / -y 30 cap each column at 30 chars
+# so results stay aligned without padding to the declared size. Pass -W for
+# compact unpadded output; the caps are dropped then, since sqlcmd rejects -W
+# with -Y/-y. Any other extra arguments are passed straight through to sqlcmd.
 
 set -u
 
@@ -34,5 +37,11 @@ tty_flag=()
 env_flag=()
 [ -n "${SQLCMDPASSWORD:-}" ] && env_flag=(-e SQLCMDPASSWORD)
 
+# Column width caps keep output aligned. sqlcmd refuses them alongside -W.
+fmt_flags=(-w 300 -Y 30 -y 30)
+for arg in "$@"; do
+    [ "$arg" = "-W" ] && fmt_flags=(-w 300)
+done
+
 exec docker exec -i "${tty_flag[@]}" "${env_flag[@]}" "$CONTAINER" \
-    "$SQLCMD" -S localhost -U sa -C "$@"
+    "$SQLCMD" -S localhost -U sa -C "${fmt_flags[@]}" "$@"
